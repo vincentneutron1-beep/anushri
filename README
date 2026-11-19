@@ -10,3 +10,1619 @@ git submodule update --init --recursive
 sudo apt-get update && sudo apt-get install -y make gcc-avr binutils-avr avr-libc python3
 sudo ln -sf /usr/bin/python3 /usr/bin/python
 make -f anu/makefile && make -f anu/makefile size && make -f anu/makef
+Anushri new code
+
+
+Summary of New Panel Controls
+
+Mode	Button / Combo	Action	LED Feedback
+Playback / Idle	Hold + Synth	Load Sequence Memory 1 (EEPROM 0x0100)	Row 1 LED lights while Hold is held
+Playback / Idle	Hold + Clk/Kbd	Load Sequence Memory 2 (EEPROM 0x01A1)	Row 2 LED lights while Hold is held
+Playback / Idle	Hold + Drums	Load Sequence Memory 3 (EEPROM 0x0242)	Row 3 LED lights while Hold is held
+Playback / Idle	Synth / Clk/Kbd	Switch Synth / Clk-Kbd knob pages as normal	Row 1 / Row 2 LEDs
+Step Recording	Hold	Insert Tie (0xfe)	4-step bar LEDs advance
+Step Recording	Drums	Toggle Slide Latch for the next note	Row 3 (Drums) LED lights while Slide is latched
+Step Recording	Clk/Kbd	Insert Rest (0xff)	4-step bar LEDs advance
+Step Recording	MIDI Key	Record note (applies & clears Slide Latch if armed)	4-step bar LEDs advance
+(Note: Because Hold + Synth, Hold + Clk/Kbd, and Hold + Drums now select Memories 1–3, MIDI Channel Learn, MIDI Out Filter, and PPQN settings are untouched in system_settings or can be configured via SysEx—if you still want MIDI Learn, you can trigger it on power-up or remap it to Hold + Rec.)
+
+
+
+File 1: anu/anu.cc (Complete Drop-In)
+Removes drum_synth.Init(), drum_synth.Render(), and silences audio_out at 0 so the 39 kHz PWM carrier never bleeds into the analog audio path.
+
+cpp
+// Copyright 2012 Emilie Gillet.
+//
+// Author: Emilie Gillet (emilie.o.gillet@gmail.com)
+//
+// This program is free software: you can redistribute it and/or modify
+// it under the terms of the GNU General Public License as published by
+// the Free Software Foundation, either version 3 of the License, or
+// (at your option) any later version.
+// This program is distributed in the hope that it will be useful,
+// but WITHOUT ANY WARRANTY; without even the implied warranty of
+// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+// GNU General Public License for more details.
+// You should have received a copy of the GNU General Public License
+// along with this program.  If not, see <http://www.gnu.org/licenses/>.
+
+#include "avrlib/boot.h"
+#include "avrlib/gpio.h"
+#include "avrlib/parallel_io.h"
+#include "avrlib/timer.h"
+#include "avrlib/watchdog_timer.h"
+
+#include "anu/clock.h"
+#include "anu/dco_controller.h"
+#include "anu/hardware_config.h"
+#include "anu/midi_dispatcher.h"
+#include "anu/parameter.h"
+#include "anu/ui.h"
+#include "anu/voice_controller.h"
+#include "anu/voice_tuner.h"
+
+#include "midi/midi.h"
+
+using namespace avrlib;
+using namespace anu;
+using namespace midi;
+
+DAC1SS dac_1_ss;
+DAC2SS dac_2_ss;
+DACInterface dac;
+
+PitchCalibrationInput pitch_calibration_input;
+DcoOut dco_out;
+
+MidiIO midi_io;
+MidiBuffer midi_in_buffer;
+MidiStreamParser<MidiDispatcher> midi_parser;
+
+Timer<0> dac_timer;
+Timer<2> clock_timer;
+TuningTimer tuning_timer;
+
+PwmOutput<3> audio_out;
+
+volatile uint8_t refresh_counter = 0;
+volatile uint16_t clock_ticks = 0;
+volatile uint8_t num_external_clock_events = 0;
+
+inline void FlushMidiOut() {
+  if (midi_dispatcher.readable_high_priority()) {
+    if (midi_io.writable()) {
+      midi_io.Overwrite(midi_dispatcher.ImmediateReadHighPriority());
+    }
+  } else {
+    if (midi_dispatcher.readable_low_priority()) {
+      if (midi_io.writable()) {
+        midi_io.Overwrite(midi_dispatcher.ImmediateReadLowPriority());
+      }
+    }
+  }
+}
+
+inline void PollMidiIn() {
+  if (midi_io.readable()) {
+    midi_in_buffer.NonBlockingWrite(midi_io.ImmediateRead());
+  }
+}
+
+inline bool UpdateDACs() {
+  Word dac_value;
+  voice_controller.mutable_voice()->ReadDACStateSample();
+  const DACState& dac_state = voice_controller.voice().dac_state();
+  
+  // Write VCO CV.
+  dac_value.value = 0x1000 | dac_state.vco_cv;
+  dac_1_ss.Low();
+  dac.Send(dac_value.bytes[1]);
+  dac.Send(dac_value.bytes[0]);
+  dac_1_ss.High();
+  
+  // Write VCF CV.
+  dac_value.value = 0x9000 | dac_state.vcf_cv;
+  dac_1_ss.Low();
+  dac.Send(dac_value.bytes[1]);
+  dac.Send(dac_value.bytes[0]);
+  dac_1_ss.High();
+  
+  // Write VCA CV.
+  dac_value.value = 0x1000 | dac_state.vca_cv;
+  dac_2_ss.Low();
+  dac.Send(dac_value.bytes[1]);
+  dac.Send(dac_value.bytes[0]);
+  dac_2_ss.High();
+  
+  // Write PWM CV.
+  dac_value.value = 0x9000 | dac_state.pw_cv;
+  dac_2_ss.Low();
+  dac.Send(dac_value.bytes[1]);
+  dac.Send(dac_value.bytes[0]);
+  dac_2_ss.High();
+  
+  return dac_state.vca_cv != 0;
+}
+
+static uint8_t cycle = 0;
+static uint8_t previous_in = 0xff;
+
+ISR(TIMER0_OVF_vect, ISR_NOBLOCK) {
+  if (cycle & 1) {
+    if (UpdateDACs()) {
+      dco_controller.set_note(voice_controller.voice().dco_pitch());
+    } else {
+      dco_controller.Mute();
+    }
+  }
+  PollMidiIn();
+  FlushMidiOut();
+  
+  uint8_t in = inputs.ReadRegister();
+  
+  if ((in & (1 << INPUT_TRIG)) && !(previous_in & (1 << INPUT_TRIG))) {
+    ++num_external_clock_events;
+  }
+  if ((in & (1 << INPUT_GATE)) && !(previous_in & (1 << INPUT_GATE))) {
+    voice_controller.GateOn();
+  }
+  if (!(in & (1 << INPUT_GATE)) && (previous_in & (1 << INPUT_GATE))) {
+    voice_controller.GateOff();
+  }
+  previous_in = in;
+  
+  uint8_t out = ui.led_pattern();
+  if (voice_controller.voice().gate() &&
+      !voice_controller.voice().retriggered()) {
+    out |= _BV(OUTPUT_GATE);
+  }
+  voice_controller.mutable_voice()->ClearRetriggeredFlag();
+  if (voice_controller.clock_pulse()) {
+    out |= _BV(OUTPUT_TRIG);
+    voice_controller.ClearClockPulse();
+  }
+  
+  if ((cycle & 0x7) == 0) {
+    TickSystemClock();
+    inputs.Process(in);
+    ui.Poll();
+  }
+  outputs.Write(out);
+  ++cycle;
+}
+
+volatile uint8_t num_overflows;
+
+ISR(TIMER1_CAPT_vect) {
+  static uint16_t previous_time = 0;
+  uint16_t current_time = ICR1;
+  uint32_t interval = current_time + \
+      (static_cast<uint32_t>(num_overflows) << 16) - previous_time;
+  previous_time = current_time;
+  num_overflows = 0;
+  voice_tuner.UpdatePitchMeasurement(interval);
+}
+
+ISR(TIMER1_OVF_vect, ISR_NOBLOCK) {
+  ++num_overflows;
+}
+
+// 39kHz clock used for the tempo counter; drum PWM output held silent at 0.
+ISR(TIMER2_OVF_vect, ISR_NOBLOCK) {
+  clock.Tick();
+  audio_out.Write(0);
+}
+
+inline void Init() {
+  sei();
+  UCSR0B = 0;
+  ResetWatchdog();
+  
+  midi_io.Init();
+  system_settings.Init();
+  voice_controller.Init();
+  voice_tuner.Init();
+  
+  dac.Init();
+  dac_1_ss.set_mode(DIGITAL_OUTPUT);
+  dac_2_ss.set_mode(DIGITAL_OUTPUT);
+  dco_out.set_mode(DIGITAL_OUTPUT);
+  
+  pitch_calibration_input.set_mode(DIGITAL_INPUT);
+  pitch_calibration_input.Low();
+  
+  ui.Init();
+  if (!(inputs.ReadRegister() & 0x4)) {
+    voice_controller.ResetToFactoryDefaults();
+    system_settings.ResetToFactoryDefaults();
+  }
+  
+  dac_timer.set_prescaler(2);
+  dac_timer.set_mode(TIMER_PWM_PHASE_CORRECT);
+  dac_timer.Start();
+  
+  clock_timer.set_prescaler(1);
+  clock_timer.set_mode(TIMER_PWM_PHASE_CORRECT);
+  clock_timer.Start();
+  
+  audio_out.Init();
+  audio_out.Write(0);
+  
+  dco_controller.Start();
+}
+
+int main(void) {
+  Init();
+  ui.FlushEvents();
+  while (1) {
+    voice_controller.mutable_voice()->Refresh();
+
+    if (voice_controller.internal_clock()) {
+      uint8_t num_events = clock.CountEvents();
+      while (num_events) {
+        voice_controller.Clock(false);
+        --num_events;
+      }
+      num_external_clock_events = 0;
+    } else {
+      while (num_external_clock_events) {
+        voice_controller.Clock(false);
+        --num_external_clock_events;
+      }
+    }
+    
+    while (midi_in_buffer.readable()) {
+      midi_parser.PushByte(midi_in_buffer.ImmediateRead());
+    }
+    
+    voice_tuner.Refresh();
+    if (num_overflows > 32) {
+      voice_tuner.Abort();
+    }
+    
+    ui.DoEvents();
+  }
+}
+Use code with caution.
+
+
+
+
+File 2: anu/voice_controller.h (Complete Drop-In)
+Adds current_sequence_slot_ (0..2), slide_latched_, SwitchSequenceSlot(), ToggleSlideLatch(), and routes InsertRest() / InsertTie() through RecordNote() so Slide latches cleanly onto the next recorded step.
+
+cpp
+// Copyright 2012 Emilie Gillet.
+//
+// Author: Emilie Gillet (emilie.o.gillet@gmail.com)
+//
+// This program is free software: you can redistribute it and/or modify
+// it under the terms of the GNU General Public License as published by
+// the Free Software Foundation, either version 3 of the License, or
+// (at your option) any later version.
+// This program is distributed in the hope that it will be useful,
+// but WITHOUT ANY WARRANTY; without even the implied warranty of
+// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+// GNU General Public License for more details.
+// You should have received a copy of the GNU General Public License
+// along with this program.  If not, see <http://www.gnu.org/licenses/>.
+
+#ifndef ANU_VOICE_CONTROLLER_H_
+#define ANU_VOICE_CONTROLLER_H_
+
+#include "avrlib/base.h"
+#include "avrlib/random.h"
+
+#include "anu/envelope.h"
+#include "anu/lfo.h"
+#include "anu/note_stack.h"
+#include "anu/voice.h"
+
+namespace anu {
+
+static const uint8_t kNumDrumParts = 3;
+static const uint8_t kNumSequenceSlots = 3;
+
+enum ArpeggiatorDirection {
+  ARPEGGIO_DIRECTION_UP = 0,
+  ARPEGGIO_DIRECTION_DOWN,
+  ARPEGGIO_DIRECTION_UP_DOWN,
+  ARPEGGIO_DIRECTION_RANDOM,
+  ARPEGGIO_DIRECTION_LAST
+};
+
+enum SequencerSettingsParameter {
+  PRM_SEQ_ARP_MODE,
+  PRM_SEQ_ARP_PATTERN,
+  PRM_SEQ_TEMPO,
+  PRM_SEQ_SWING,
+  PRM_SEQ_DRUMS_X,
+  PRM_SEQ_DRUMS_Y,
+  PRM_SEQ_DRUMS_BD_DENSITY,
+  PRM_SEQ_DRUMS_SD_DENSITY,
+  PRM_SEQ_DRUMS_HH_DENSITY,
+  PRM_SEQ_DRUMS_BD_TONE,
+  PRM_SEQ_DRUMS_SD_TONE,
+  PRM_SEQ_DRUMS_HH_TONE,
+  PRM_SEQ_DRUMS_BALANCE,
+  PRM_SEQ_DRUMS_BANDWIDTH,
+  PRM_SEQ_DRUMS_OVERRIDE,
+  PRM_SEQ_DRUMS_BD_PATTERN_L,
+  PRM_SEQ_DRUMS_BD_PATTERN_H,
+  PRM_SEQ_DRUMS_SD_PATTERN_L,
+  PRM_SEQ_DRUMS_SD_PATTERN_H,
+  PRM_SEQ_DRUMS_HH_PATTERN_L,
+  PRM_SEQ_DRUMS_HH_PATTERN_H,
+  PRM_SEQ_ARP_ACIDITY,
+  PRM_SEQ_PADDING_1,
+  PRM_SEQ_PADDING_2,
+  PRM_SEQ_LAST
+};
+
+struct SequencerSettings {
+  uint8_t arp_mode;
+  uint8_t arp_pattern;
+  uint8_t tempo;
+  uint8_t swing;
+  
+  uint8_t drums_x;
+  uint8_t drums_y;
+  uint8_t drums_density[kNumDrumParts];
+  uint8_t drums_tone[kNumDrumParts];
+  uint8_t drums_balance;
+  uint8_t drums_bandwidth;
+  
+  uint8_t drums_override;
+  uint16_t drums_pattern[kNumDrumParts];
+  
+  uint8_t acidity;
+  uint8_t padding[2];
+  
+  inline uint8_t arp_range() const { return ((arp_mode - 1) & 0x01) + 1; }
+  inline uint8_t arp_direction() const { return (arp_mode - 1) >> 1; }
+  inline bool has_drums() const { return false; }
+};
+
+struct Sequence {
+  uint8_t num_notes;
+  uint8_t notes[128];
+  uint8_t accents[16];
+  uint8_t slides[16];
+};
+
+class VoiceController {
+ public:
+  VoiceController() { }
+  ~VoiceController() { }
+  static void Init();
+  static void NoteOn(uint8_t note, uint8_t velocity);
+  static void NoteOff(uint8_t note);
+  static void ControlChange(uint8_t controller, uint8_t value);
+  static void PitchBend(uint16_t pitch_bend);
+  static void Aftertouch(uint8_t velocity);
+  static void AllSoundOff();
+  static void ResetAllControllers();
+  static void AllNotesOff();
+  static void Clock(bool midi_generated);
+  
+  static inline void Start() {
+    StartClock();
+    StartArpeggiator();
+    StartSequencer();
+  }
+  static inline void Stop() {
+    StopSequencer();
+    StopClock();
+  }
+  
+  static void RecordStep(uint8_t note);
+  
+  static inline void InsertRest() {
+    RecordStep(0xff);
+  }
+  
+  static inline void InsertTie() {
+    RecordStep(0xfe);
+  }
+  
+  static inline void ToggleSlideLatch() {
+    if (sequencer_recording_) {
+      slide_latched_ = !slide_latched_;
+    }
+  }
+  
+  static void SwitchSequenceSlot(uint8_t slot);
+  static void LoadSequence();
+  
+  static inline void HoldNotes() {
+    if (ignore_note_off_messages_) {
+      ReleaseAllHeldNotes();
+    } else {
+      if (pressed_keys_.size()) {
+        ignore_note_off_messages_ = true;
+      }
+    }
+  }
+  
+  static void StopRecording();
+  static void SaveSequence();
+  static inline void RemoteControlDrumSequencer(uint8_t note) { }
+  static void StartRecording();
+  
+  static void GateOn() { voice_.GateOn(); }
+  static void GateOff() { voice_.GateOff(); }
+  
+  static inline const Voice& voice() { return voice_; }
+  static inline Voice* mutable_voice() { return &voice_; }
+  static inline Sequence* mutable_sequence() { return &sequence_; }
+  static inline SequencerSettings* mutable_sequencer_settings() {
+    return &seq_settings_;
+  }
+
+  static inline bool sequencer_running() { return sequencer_running_; }
+  static inline bool sequencer_recording() { return sequencer_recording_; }
+  static inline bool slide_latched() { return slide_latched_; }
+  static inline uint8_t current_sequence_slot() { return current_sequence_slot_; }
+  static inline bool hold_state() { return ignore_note_off_messages_; }
+  static inline uint8_t clock_pulse() { return clock_pulse_; }
+  static inline uint8_t sequencer_step() { return sequencer_note_; }
+  static inline uint8_t sequence_length() { return sequence_.num_notes; }
+  static inline uint8_t internal_clock() { return seq_settings_.tempo >= 40; }
+  static inline bool at_rest() {
+    return pressed_keys_.size() == 0 && !sequencer_running_ && voice_.at_rest();
+  }
+  static inline bool has_drums() { return false; }
+  static inline bool has_arpeggiator() {
+    return (seq_settings_.arp_mode && pressed_keys_.size());
+  }
+  
+  static inline void ClearClockPulse() {
+    --clock_pulse_;
+  }
+  
+  static void SetValue(uint8_t address, uint8_t value);
+  
+  static uint8_t GetValue(uint8_t address) {
+    const uint8_t* bytes;
+    bytes = static_cast<const uint8_t*>(static_cast<const void*>(&seq_settings_));
+    return bytes[address];
+  }
+  static void SavePatch();
+  static void ResetToFactoryDefaults();
+  static void ReleaseAllHeldNotes();
+  
+  static void Touch() {
+    voice_.Touch();
+  }
+  static void TouchClock();
+  
+ private:
+  static void ResetArpeggiatorPattern();
+
+  static void StartClock();
+  static void StopClock();
+  static void StartArpeggiator();
+  static void ClockArpeggiator();
+  static void StopArpeggiator();
+  static void StepArpeggiator();
+
+  static void StartSequencer();
+  static void ClockSequencer();
+  static void StopSequencer();
+  
+  static SequencerSettings seq_settings_;
+  static Sequence sequence_;
+  static Voice voice_;
+  
+  static bool ignore_note_off_messages_;
+  static uint8_t clock_pulse_;
+  static uint8_t clock_counter_;
+  static uint8_t lfo_sync_counter_;
+  
+  static NoteStack<16> pressed_keys_;
+
+  static bool sequencer_running_;
+  static bool sequencer_recording_;
+  static bool slide_latched_;
+  static uint8_t current_sequence_slot_;
+  static bool clock_running_;
+  static uint8_t sequencer_note_;
+  static int8_t sequencer_transposition_;
+  static uint8_t sequencer_velocity_;
+  
+  static uint8_t previous_generated_note_;
+  static uint16_t arp_pattern_mask_;
+  static uint8_t arp_pattern_step_;
+  static int8_t arp_direction_;
+  static int8_t arp_step_;
+  static int8_t arp_octave_;
+  
+  static bool dirty_;
+  
+  DISALLOW_COPY_AND_ASSIGN(VoiceController);
+};
+
+extern VoiceController voice_controller;
+
+};  // namespace anu
+
+#endif  // ANU_VOICE_CONTROLLER_H_
+Use code with caution.
+
+
+
+
+File 3: anu/voice_controller.cc (Complete Drop-In)
+Implements 3-slot EEPROM storage at 256, 417, and 578 via avr/eeprom.h, strips all drum_synth and wav_res_drum_map_node_* references, and applies slide_latched_ inside RecordStep().
+
+cpp
+// Copyright 2012 Emilie Gillet.
+//
+// Author: Emilie Gillet (emilie.o.gillet@gmail.com)
+//
+// This program is free software: you can redistribute it and/or modify
+// it under the terms of the GNU General Public License as published by
+// the Free Software Foundation, either version 3 of the License, or
+// (at your option) any later version.
+// This program is distributed in the hope that it will be useful,
+// but WITHOUT ANY WARRANTY; without even the implied warranty of
+// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+// GNU General Public License for more details.
+// You should have received a copy of the GNU General Public License
+// along with this program.  If not, see <http://www.gnu.org/licenses/>.
+
+#include "anu/voice_controller.h"
+
+#include <avr/eeprom.h>
+#include <avr/pgmspace.h>
+
+#include "avrlib/op.h"
+#include "midi/midi.h"
+
+#include "anu/clock.h"
+#include "anu/midi_dispatcher.h"
+#include "anu/parameter.h"
+#include "anu/storage.h"
+#include "anu/system_settings.h"
+
+namespace anu {
+  
+using namespace avrlib;
+
+/* <static> */
+SequencerSettings VoiceController::seq_settings_;
+Sequence VoiceController::sequence_;
+Voice VoiceController::voice_;
+
+bool VoiceController::ignore_note_off_messages_;
+uint8_t VoiceController::clock_pulse_;
+uint8_t VoiceController::clock_counter_;
+
+NoteStack<16> VoiceController::pressed_keys_;
+
+bool VoiceController::clock_running_;
+bool VoiceController::sequencer_running_;
+bool VoiceController::sequencer_recording_;
+bool VoiceController::slide_latched_;
+uint8_t VoiceController::current_sequence_slot_;
+uint8_t VoiceController::sequencer_note_;
+int8_t VoiceController::sequencer_transposition_;
+uint8_t VoiceController::sequencer_velocity_;
+
+uint8_t VoiceController::previous_generated_note_;
+uint16_t VoiceController::arp_pattern_mask_;
+uint8_t VoiceController::arp_pattern_step_;
+int8_t VoiceController::arp_direction_;
+int8_t VoiceController::arp_step_;
+int8_t VoiceController::arp_octave_;
+uint8_t VoiceController::lfo_sync_counter_;
+
+bool VoiceController::dirty_;
+/* </static> */
+
+typedef SequencerSettings PROGMEM prog_SequencerSettings;
+typedef Sequence PROGMEM prog_Sequence;
+
+static const prog_SequencerSettings init_seq_settings PROGMEM = {
+  // Arp range and pattern
+  0, 0,
+  
+  // Tempo and swing
+  120, 0, 
+  
+  // Drum parameters (unused)
+  0, 0,
+  0, 0,
+  0, 0,
+  0, 0,
+  128, 255,
+  
+  0, 0, 0, 0,
+  
+  // Acidity
+  0,
+  
+  // Padding
+  0, 0,
+};
+
+static const prog_Sequence init_sequence PROGMEM = {
+  4,
+  { 60, 60, 48, 48 }
+};
+
+template<>
+struct StorageLayout<SequencerSettings> {
+  static uint8_t* eeprom_address() { 
+    return (uint8_t*)(192);
+  }
+  static const prog_char* init_data() {
+    return (prog_char*)&init_seq_settings;
+  }
+};
+
+template<>
+struct StorageLayout<Sequence> {
+  static uint8_t* eeprom_address() { 
+    return (uint8_t*)(256);
+  }
+  static const prog_char* init_data() {
+    return (prog_char*)&init_sequence;
+  }
+};
+
+static const uint16_t kSequenceEepromBase = 256;
+
+uint8_t clock_divisions[] = { 1, 2, 6 };
+uint8_t clock_internal_rate_compensation[] = { 6, 3, 1 };
+
+/* static */
+void VoiceController::Init() {
+  STATIC_ASSERT(sizeof(SequencerSettings) == PRM_SEQ_LAST);
+  
+  current_sequence_slot_ = 0;
+  slide_latched_ = false;
+  
+  storage.Load(&seq_settings_);
+  LoadSequence();
+  pressed_keys_.Init();
+  voice_.Init();
+
+  ignore_note_off_messages_ = false;
+  sequencer_running_ = false;
+  sequencer_transposition_ = 0;
+  sequencer_velocity_ = 64;
+
+  // At boot, set the VCO to the reference note (C3).
+  voice_.set_note(system_settings.reference_note());
+  TouchClock();
+  dirty_ = false;
+}
+
+/* static */
+void VoiceController::LoadSequence() {
+  uint16_t addr = kSequenceEepromBase + current_sequence_slot_ * sizeof(Sequence);
+  eeprom_read_block(&sequence_, reinterpret_cast<const void*>(addr), sizeof(Sequence));
+  if (sequence_.num_notes > 128) {
+    sequence_.num_notes = 0;
+  }
+  sequencer_note_ = 0;
+}
+
+/* static */
+void VoiceController::SaveSequence() {
+  uint16_t addr = kSequenceEepromBase + current_sequence_slot_ * sizeof(Sequence);
+  eeprom_update_block(&sequence_, reinterpret_cast<void*>(addr), sizeof(Sequence));
+}
+
+/* static */
+void VoiceController::SwitchSequenceSlot(uint8_t slot) {
+  if (slot >= kNumSequenceSlots || slot == current_sequence_slot_) {
+    return;
+  }
+  current_sequence_slot_ = slot;
+  LoadSequence();
+}
+
+/* static */
+void VoiceController::TouchClock() {
+  clock.Update(
+      seq_settings_.tempo,
+      1,
+      seq_settings_.swing >> 1,
+      clock_internal_rate_compensation[system_settings.clock_ppqn()]);
+}
+
+/* static */
+void VoiceController::SetValue(uint8_t offset, uint8_t value) {
+  uint8_t* bytes;
+  bytes = static_cast<uint8_t*>(static_cast<void*>(&seq_settings_));
+  uint8_t previous_value = bytes[offset];
+  bytes[offset] = value;
+  if (value != previous_value) {
+    dirty_ = true;
+    if (offset == PRM_SEQ_ARP_MODE) {
+      arp_direction_ = \
+          seq_settings_.arp_direction() == ARPEGGIO_DIRECTION_DOWN ? -1 : 1;
+    } else if (offset >= PRM_SEQ_TEMPO && offset <= PRM_SEQ_SWING) {
+      TouchClock();
+    }
+  }
+}
+
+/* static */
+void VoiceController::RecordStep(uint8_t note) {
+  if (!sequencer_recording_ || sequence_.num_notes >= 128) {
+    return;
+  }
+  uint8_t step = sequence_.num_notes;
+  sequence_.notes[step] = note;
+  
+  uint8_t byte_index = step >> 3;
+  uint8_t bit_mask = 1 << (step & 0x7);
+  if (slide_latched_) {
+    sequence_.slides[byte_index] |= bit_mask;
+    slide_latched_ = false;
+  } else {
+    sequence_.slides[byte_index] &= ~bit_mask;
+  }
+  
+  ++sequence_.num_notes;
+  if (sequence_.num_notes == 128) {
+    StopRecording();
+  }
+}
+
+/* static */
+void VoiceController::NoteOn(uint8_t note, uint8_t velocity) {
+  if (velocity == 0) {
+    NoteOff(note);
+  } else {
+    if (sequencer_running_ && sequence_.num_notes) {
+      sequencer_transposition_ = note - 60;
+      sequencer_velocity_ = velocity;
+    } else {
+      pressed_keys_.NoteOn(note, velocity);
+      if (seq_settings_.arp_mode == 0) {
+        voice_.NoteOn(note, velocity, 0, 0, pressed_keys_.size() != 1);
+      } else {
+        if (pressed_keys_.size() == 1 && !clock_running_) {
+          StartClock();
+          StartArpeggiator();
+        }
+      }
+    }
+    if (sequencer_recording_) {
+      RecordStep(note);
+    }
+  }
+}
+
+/* static */
+void VoiceController::NoteOff(uint8_t note) {
+  if (!(sequencer_running_ && sequence_.num_notes)
+      && !ignore_note_off_messages_) {
+    if (seq_settings_.arp_mode == 0) {
+      uint8_t top_note = pressed_keys_.most_recent_note().note;
+      pressed_keys_.NoteOff(note);
+      if (pressed_keys_.size() == 0) {
+        voice_.NoteOff(note);
+      } else {
+        if (top_note == note) {
+          voice_.NoteOn(
+              pressed_keys_.most_recent_note().note,
+              pressed_keys_.most_recent_note().velocity,
+              0,
+              0,
+              true);
+        }
+      }
+    } else {
+      pressed_keys_.NoteOff(note);
+      if (pressed_keys_.size() == 0) {
+        StopArpeggiator();
+        if (!sequencer_running_) {
+          StopClock();
+        }
+      }
+    }
+  }
+}
+
+/* static */
+void VoiceController::ReleaseAllHeldNotes() {
+  ignore_note_off_messages_ = false;
+  while (pressed_keys_.size()) {
+    NoteOff(pressed_keys_.most_recent_note().note);
+  }
+}
+
+/* static */
+void VoiceController::ControlChange(uint8_t controller, uint8_t value) {
+  if (controller == midi::kModulationWheelMsb &&
+      sequencer_recording_ &&
+      value > 0x40)  {
+    uint8_t accent_slide_index = sequence_.num_notes >> 3;
+    uint8_t accent_slide_mask = 1 << (sequence_.num_notes & 0x7);
+    sequence_.accents[accent_slide_index] |= accent_slide_mask;
+  }
+  voice_.ControlChange(controller, value);
+  switch (controller) {
+    case midi::kHoldPedal:
+      if (value >= 64) {
+        ignore_note_off_messages_ = true;
+      } else {
+        ReleaseAllHeldNotes();
+      }
+      break;
+  }
+  uint8_t parameter_number = parameter_manager.LookupCCMap(controller);
+  if (parameter_number != 0xff) {
+    parameter_manager.SetScaled(parameter_number, value << 1);
+  }
+}
+
+/* static */
+void VoiceController::PitchBend(uint16_t pitch_bend) {
+  voice_.PitchBend(pitch_bend);
+  if (sequencer_recording_ &&
+      (pitch_bend > 8192 + 2048 || pitch_bend < 8192 - 2048)) {
+    uint8_t accent_slide_index = sequence_.num_notes >> 3;
+    uint8_t accent_slide_mask = 1 << (sequence_.num_notes & 0x7);
+    sequence_.slides[accent_slide_index] |= accent_slide_mask;
+  }
+}
+
+/* static */
+void VoiceController::Aftertouch(uint8_t velocity) {
+  voice_.Aftertouch(velocity);
+}
+
+/* static */
+void VoiceController::AllSoundOff() {
+  pressed_keys_.Clear();
+  voice_.AllSoundOff();
+}
+
+/* static */
+void VoiceController::ResetAllControllers() {
+  voice_.ResetAllControllers();
+}
+
+/* static */
+void VoiceController::AllNotesOff() {
+  pressed_keys_.Clear();
+  voice_.GateOff();
+}
+
+/* static */
+void VoiceController::Clock(bool midi_generated) {
+  clock_pulse_ = 8;
+  voice_.set_lfo_pll_target_phase(lfo_sync_counter_);
+  if (!clock_counter_) {
+    ClockArpeggiator();
+    ClockSequencer();
+  }
+  midi_dispatcher.OnClock(midi_generated);
+  ++clock_counter_;
+  if (clock_counter_ >= clock_divisions[system_settings.clock_ppqn()]) {
+    clock_counter_ = 0;
+  }
+  ++lfo_sync_counter_;
+  if (lfo_sync_counter_ == 24) {
+    lfo_sync_counter_ = 0;
+  }
+}
+
+/* static */
+void VoiceController::StartClock() {
+  clock.Reset();
+  clock_counter_ = 0;
+  lfo_sync_counter_ = 0;
+  clock_running_ = true;
+  midi_dispatcher.OnStart();
+}
+
+/* static */
+void VoiceController::StartSequencer() {
+  if (!(pressed_keys_.size() && sequence_.num_notes == 0)) {
+    AllSoundOff();
+  }
+  if (sequencer_recording_) {
+    StopRecording();
+  }
+  sequencer_note_ = 0;
+  sequencer_running_ = true;
+}
+
+/* static */
+void VoiceController::StartArpeggiator() {
+  voice_.AllSoundOff();
+  previous_generated_note_ = 0xff;
+  arp_pattern_mask_ = 0x1;
+  arp_pattern_step_ = 0;
+  arp_direction_ = \
+Use code with caution.
+
+seq_settings_.arp_direction() == ARPEGGIO_DIRECTION_DOWN ? -1 : 1;
+ResetArpeggiatorPattern();
+}
+/* static */
+void VoiceController::StopClock() {
+clock_running_ = false;
+midi_dispatcher.OnStop();
+}
+/* static */
+void VoiceController::StopSequencer() {
+AllSoundOff();
+midi_dispatcher.OnInternalNoteOff(previous_generated_note_);
+previous_generated_note_ = 0xff;
+sequencer_running_ = false;
+}
+/* static */
+void VoiceController::StopArpeggiator() {
+AllNotesOff();
+midi_dispatcher.OnInternalNoteOff(previous_generated_note_);
+previous_generated_note_ = 0xff;
+}
+/* static */
+void VoiceController::ClockSequencer() {
+if (!sequence_.num_notes || !sequencer_running_) {
+return;
+}
+int16_t note = sequence_.notes[sequencer_note_];
+if (note == 0xff) {
+// Rest.
+voice_.NoteOff(previous_generated_note_);
+midi_dispatcher.OnInternalNoteOff(previous_generated_note_);
+previous_generated_note_ = 0xff;
+} else if (note == 0xfe) {
+// Tie: do nothing!
+} else {
+uint8_t accent_slide_index = sequencer_note_ >> 3;
+uint8_t accent_slide_mask = 1 << (sequencer_note_ & 0x7);
+note += sequencer_transposition_;
+bool slid = sequence_.slides[accent_slide_index] & accent_slide_mask;
+bool accented = sequence_.accents[accent_slide_index] & accent_slide_mask;
+if (!slid) {
+midi_dispatcher.OnInternalNoteOff(previous_generated_note_);
+}
+voice_.NoteOn(
+note,
+sequencer_velocity_,
+slid ? 0x60 : 0,
+accented ? 0x70 : 0,
+slid);
+midi_dispatcher.OnInternalNoteOn(
+note,
+accented ? 0x7f : sequencer_velocity_);
+if (previous_generated_note_ != 0xff && slid) {
+midi_dispatcher.OnInternalNoteOff(previous_generated_note_);
+}
+previous_generated_note_ = note;
+}
+++sequencer_note_;
+if (sequencer_note_ >= sequence_.num_notes) {
+sequencer_note_ = 0;
+}
+}
+const prog_uint8_t slide_probability[] PROGMEM = {
+1, 0, 4, 4, 2, 0, 8, 6, 1, 1, 0, 0, 0, 0, 15, 15,
+};
+const prog_uint8_t accent_level[] PROGMEM = {
+16, 0, 2, 0, 1, 0, 0, 0, 8, 0, 1, 0, 4, 0, 2, 2,
+};
+/* static */
+void VoiceController::ClockArpeggiator() {
+if (has_arpeggiator()) {
+uint16_t pattern = pgm_read_word(
+lut_res_arpeggiator_patterns + seq_settings_.arp_pattern);
+uint8_t has_arpeggiator_note = (arp_pattern_mask_ & pattern) ? 255 : 0;
+if (has_arpeggiator_note) {
+StepArpeggiator();
+const NoteEntry& arpeggio_note = pressed_keys_.sorted_note(arp_step_);
+uint8_t note = arpeggio_note.note;
+uint8_t velocity = arpeggio_note.velocity;
+note += 12 * arp_octave_;
+while (note > 127) {
+note -= 12;
+}
+uint8_t random = Random::GetByte();
+uint8_t slide_threshold = U8U8Mul(
+pgm_read_byte(slide_probability + arp_pattern_step_),
+seq_settings_.acidity);
+if (arp_step_ == 0) {
+slide_threshold >>= 1;
+}
+uint8_t accent = U8U8Mul(
+pgm_read_byte(accent_level + arp_pattern_step_),
+seq_settings_.acidity) >> 1;
+accent = (accent + U8U8MulShift8(accent, random)) >> 1;
+bool slid = random < slide_threshold;
+if (!slid) {
+midi_dispatcher.OnInternalNoteOff(previous_generated_note_);
+}
+voice_.NoteOn(note, velocity, slid ? 0x60 : 0, accent, slid);
+if (slid) {
+midi_dispatcher.OnInternalNoteOff(previous_generated_note_);
+}
+midi_dispatcher.OnInternalNoteOn(note, velocity);
+previous_generated_note_ = note;
+} else {
+voice_.NoteOff(previous_generated_note_);
+midi_dispatcher.OnInternalNoteOff(previous_generated_note_);
+previous_generated_note_ = 0xff;
+}
+}
+++arp_pattern_step_;
+arp_pattern_mask_ <<= 1;
+if (!arp_pattern_mask_) {
+arp_pattern_mask_ = 1;
+arp_pattern_step_ = 0;
+}
+}
+/* static */
+void VoiceController::ResetArpeggiatorPattern() {
+arp_step_ = arp_direction_ == 1 ? -1 : pressed_keys_.size();
+arp_octave_ = arp_direction_ == 1 ? 0 : seq_settings_.arp_range() - 1;
+}
+/* static */
+void VoiceController::StepArpeggiator() {
+uint8_t num_notes = pressed_keys_.size();
+if (seq_settings_.arp_direction() == ARPEGGIO_DIRECTION_RANDOM) {
+uint8_t random_byte = Random::GetByte();
+arp_octave_ = random_byte & 0xf;
+arp_step_ = (random_byte & 0xf0) >> 4;
+while (arp_octave_ >= seq_settings_.arp_range()) {
+arp_octave_ -= seq_settings_.arp_range();
+}
+while (arp_step_ >= num_notes) {
+arp_step_ -= num_notes;
+}
+} else {
+arp_step_ += arp_direction_;
+uint8_t change_octave = 0;
+if (arp_step_ >= num_notes) {
+arp_step_ = 0;
+change_octave = 1;
+} else if (arp_step_ < 0) {
+arp_step_ = num_notes - 1;
+change_octave = 1;
+}
+if (change_octave) {
+arp_octave_ += arp_direction_;
+if (arp_octave_ >= seq_settings_.arp_range() || arp_octave_ < 0) {
+if (seq_settings_.arp_direction() == ARPEGGIO_DIRECTION_UP_DOWN) {
+arp_direction_ = -arp_direction_;
+ResetArpeggiatorPattern();
+if (num_notes > 1 || seq_settings_.arp_range() > 1) {
+StepArpeggiator();
+}
+} else {
+ResetArpeggiatorPattern();
+}
+}
+}
+}
+}
+/* static */
+void VoiceController::StartRecording() {
+Stop();
+StopArpeggiator();
+seq_settings_.arp_mode = 0;
+sequencer_recording_ = true;
+slide_latched_ = false;
+memset(&sequence_, 0, sizeof(Sequence));
+}
+/* static */
+void VoiceController::StopRecording() {
+Stop();
+sequencer_recording_ = false;
+slide_latched_ = false;
+sequencer_transposition_ = 0;
+sequencer_velocity_ = 64;
+SaveSequence();
+}
+/* static */
+void VoiceController::SavePatch() {
+if (dirty_) {
+storage.Save(seq_settings_);
+}
+voice_.SavePatch();
+dirty_ = false;
+}
+/* static /
+void VoiceController::ResetToFactoryDefaults() {
+storage.ResetToFactoryDefaults(&seq_settings_);
+for (uint8_t slot = 0; slot < kNumSequenceSlots; ++slot) {
+Sequence temp_seq;
+memcpy_P(&temp_seq, &init_sequence, sizeof(Sequence));
+uint16_t addr = kSequenceEepromBase + slot * sizeof(Sequence);
+eeprom_update_block(&temp_seq, reinterpret_cast<void>(addr), sizeof(Sequence));
+}
+LoadSequence();
+voice_.ResetToFactoryDefaults();
+}
+/* extern */
+VoiceController voice_controller;
+}; // namespace anu
+
+---
+
+### File 4: `anu/ui.cc` (Complete Drop-In)
+Maps:
+* **Hold + Synth / Clk-Kbd / Drums** (`CONTROL_SHIFT_ADSR_BUTTON`, `CONTROL_SHIFT_KBD_BUTTON`, `CONTROL_SHIFT_SEQ_BUTTON`) -> Switch Sequence Slot `0`, `1`, `2`
+* **Recording Mode:** `Hold` = Tie, `Drums` = Toggle Slide Latch, `Clk/Kbd` = Rest
+* **LEDs:** Lights the active sequence slot LED while **Hold** is pressed, and lights the **Drums (Row 3) LED** during recording whenever `slide_latched_` is active.
+
+```cpp
+// Copyright 2012 Emilie Gillet.
+//
+// Author: Emilie Gillet (emilie.o.gillet@gmail.com)
+//
+// This program is free software: you can redistribute it and/or modify
+// it under the terms of the GNU General Public License as published by
+// the Free Software Foundation, either version 3 of the License, or
+// (at your option) any later version.
+// This program is distributed in the hope that it will be useful,
+// but WITHOUT ANY WARRANTY; without even the implied warranty of
+// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+// GNU General Public License for more details.
+// You should have received a copy of the GNU General Public License
+// along with this program.  If not, see <http://www.gnu.org/licenses/>.
+
+#include "anu/ui.h"
+
+#include "avrlib/adc.h"
+
+#include "anu/hardware_config.h"
+#include "anu/midi_dispatcher.h"
+#include "anu/parameter.h"
+#include "anu/strummer.h"
+#include "anu/sysex_handler.h"
+#include "anu/system_settings.h"
+#include "anu/voice_controller.h"
+#include "anu/voice_tuner.h"
+
+namespace anu {
+
+static const uint8_t kNumSoftPots = 10;
+static const uint8_t kNumRows = 3;
+
+using namespace avrlib;
+
+/* <static> */
+uint8_t Ui::led_pattern_;
+avrlib::EventQueue<16> Ui::queue_;
+uint8_t Ui::active_row_ = 0;
+uint8_t Ui::inhibit_switch_ = 0;
+uint8_t Ui::pwm_cycle_;
+uint8_t Ui::display_mode_;
+uint16_t Ui::adc_values_[kNumPots];
+uint8_t Ui::adc_thresholds_[kNumPots];
+uint8_t Ui::scanned_pot_;
+uint8_t Ui::pot_scanning_warm_up_ = 16;
+bool Ui::busy_ = false;
+bool Ui::snapped_[kNumPots];
+int16_t Ui::snap_position_cache_[kNumPots];
+int8_t Ui::display_snap_delta_ = 0;
+uint8_t Ui::disable_switch_sensing_ = 0;
+uint16_t Ui::long_press_counter_ = 0;
+bool Ui::strummer_enabled_ = false;
+/* </static> */
+
+Adc adc;
+
+AdcMuxBank1SS mux_bank1_ss;
+AdcMuxBank2SS mux_bank2_ss;
+AdcMuxAddress mux_address;
+
+/* static */
+void Ui::Init() {
+  inputs.Init();
+  outputs.Init();
+  display_mode_ = DISPLAY_MODE_LFO_GATE_CLOCK;
+
+  mux_bank1_ss.set_mode(DIGITAL_OUTPUT);
+  mux_bank1_ss.High();
+  mux_bank2_ss.set_mode(DIGITAL_OUTPUT);
+  mux_bank2_ss.High();
+  mux_address.set_mode(DIGITAL_OUTPUT);
+  
+  adc.set_alignment(ADC_RIGHT_ALIGNED);
+  adc.set_reference(ADC_DEFAULT);
+  adc.Init();
+  adc.StartConversion(kAdcInputMux);
+  memset(adc_thresholds_, 4, kNumPots);
+  memset(snapped_, true, kNumPots);
+  parameter_manager.Init();
+}
+
+const uint8_t pots_layout[] = {
+  // Bottom row
+   6,  0,  4,  2,  1,
+   3,  7,  5,  9, 11, 
+  // Upper row
+  14, 10, 12,  8,
+};
+
+/* static */
+void Ui::Poll() {
+  UpdateLeds();
+  if (disable_switch_sensing_) {
+    --disable_switch_sensing_;
+  } else {
+    uint8_t mask = 1;
+    for (uint8_t i = 0; i < kNumSwitches; ++i) {
+      if (inputs.raised(i + 2)) {
+        if ((inhibit_switch_ & mask)) {
+          inhibit_switch_ ^= mask;
+        } else {
+          uint8_t control_index = CONTROL_SEQ_BUTTON;
+          // Allow Hold+Button slot switching only when NOT recording, so Hold
+          // acts immediately as a Tie button during step recording.
+          if (inputs.low(3) && !voice_controller.sequencer_recording()) {
+            inhibit_switch_ = _BV(1);
+            control_index = CONTROL_SHIFT_SEQ_BUTTON;
+          }
+          control_index += i;
+          queue_.AddEvent(CONTROL_SWITCH, control_index, 1);
+          disable_switch_sensing_ = 61;
+          long_press_counter_ = 0;
+        }
+      }
+      mask <<= 1;
+    }
+    if (inputs.lowered(3) || inputs.lowered(5)) {
+      long_press_counter_ = 0;
+    }
+    if (inputs.low(3) || inputs.low(5)) {
+      ++long_press_counter_;
+    }
+    if (long_press_counter_ == 1224) {
+      if (inputs.low(3) && !voice_controller.sequencer_recording()) {
+        queue_.AddEvent(CONTROL_SWITCH, CONTROL_SHIFT_LONG_PRESS, 1);
+        inhibit_switch_ = _BV(1);
+      } else if (inputs.low(5)) {
+        queue_.AddEvent(CONTROL_SWITCH, CONTROL_RUN_STOP_LONG_PRESS, 1);
+        inhibit_switch_ = _BV(3);
+      }
+    }
+  }
+  
+  uint16_t adc_value = adc.ReadOut();
+  int16_t delta = adc_values_[scanned_pot_] - adc_value;
+  if (delta < 0) {
+    delta = -delta;
+  }
+  if (delta >= adc_thresholds_[scanned_pot_]) {
+    adc_values_[scanned_pot_] = adc_value;
+    if (!pot_scanning_warm_up_) {
+      queue_.AddEvent(CONTROL_POT, scanned_pot_, adc_value >> 2);
+    }
+  }
+  mux_bank1_ss.High();
+  mux_bank2_ss.High();
+  ++scanned_pot_;
+  if (scanned_pot_ == kNumPots) {
+    scanned_pot_ = 0;
+    if (pot_scanning_warm_up_) {
+      --pot_scanning_warm_up_;
+    }
+  }
+  uint8_t address = pots_layout[scanned_pot_];
+  if (address & 0x08) {
+    mux_bank2_ss.Low();
+  } else {
+    mux_bank1_ss.Low();
+  }
+  mux_address.Write(address & 0x07);
+  
+  adc.StartConversion(kAdcInputMux);
+}
+
+/* static */
+void Ui::UnlockPot(uint8_t index) {
+  if (index < kNumSoftPots) {
+    adc_thresholds_[index] = 8;
+  } else {
+    adc_thresholds_[index] = 4;
+  }
+}
+
+/* static */
+void Ui::LockPots(bool snap) {
+  queue_.Flush();
+  memset(adc_thresholds_, 16, kNumSoftPots);
+  memset(snapped_, !snap, kNumSoftPots);
+  memset(snap_position_cache_, 0xff, sizeof(snap_position_cache_));
+  display_snap_delta_ = 0;
+}
+
+/* static */
+void Ui::HandleSwitchEvent(uint8_t index) {
+  if (display_mode_ == DISPLAY_MODE_MIDI_FILTER) {
+    uint8_t mask = 1 << index;
+    system_settings.set_midi_out_mode(system_settings.midi_out_mode() ^ mask);
+    return;
+  }
+  switch (index) {
+    case CONTROL_ADSR_BUTTON:
+      active_row_ = 0;
+      LockPots(false);
+      break;
+    
+    case CONTROL_KBD_BUTTON:
+      if (voice_controller.sequencer_recording()) {
+        voice_controller.InsertRest();
+      } else {
+        active_row_ = 1;
+        LockPots(true);
+      }
+      break;
+      
+    case CONTROL_SEQ_BUTTON:
+      if (voice_controller.sequencer_recording()) {
+        voice_controller.ToggleSlideLatch();
+      }
+      // When not recording, Drums knob page is disabled.
+      break;
+      
+    case CONTROL_RUN_STOP_BUTTON:
+      if (voice_controller.sequencer_running()) {
+        voice_controller.Stop();
+      } else {
+        voice_controller.Start();
+      }
+      break;
+      
+    case CONTROL_REC_BUTTON:
+      if (voice_controller.sequencer_recording()) {
+        busy_ = true;
+        voice_controller.StopRecording();
+        busy_ = false;
+        strummer_enabled_ = false;
+      } else {
+        voice_controller.StartRecording();
+      }
+      break;
+      
+    case CONTROL_HOLD_BUTTON:
+      if (voice_controller.sequencer_recording()) {
+        voice_controller.InsertTie();
+      } else if (strummer_enabled_) {
+        strummer_enabled_ = false;
+        voice_controller.ReleaseAllHeldNotes();
+      } else {
+        voice_controller.HoldNotes();
+      }
+      break;
+      
+    case CONTROL_SHIFT_ADSR_BUTTON:
+      voice_controller.SwitchSequenceSlot(0);
+      break;
+
+    case CONTROL_SHIFT_KBD_BUTTON:
+      voice_controller.SwitchSequenceSlot(1);
+      break;
+      
+    case CONTROL_SHIFT_SEQ_BUTTON:
+      voice_controller.SwitchSequenceSlot(2);
+      break;
+    
+    case CONTROL_SHIFT_RUN_STOP_BUTTON:
+      voice_tuner.StartTuning();
+      break;
+      
+    case CONTROL_SHIFT_REC_BUTTON:
+      system_settings.set_calibration_data(60 * 128, 64000 / 3, 64000 / 3);
+      break;
+      
+    case CONTROL_SHIFT_LONG_PRESS:
+      strummer.Start();
+      strummer_enabled_ = true;
+      break;
+      
+    case CONTROL_RUN_STOP_LONG_PRESS:
+      sysex_handler.BulkDump();
+      break;
+  }
+}
+
+const prog_uint8_t pot_to_parameter_map[16 * kNumRows] PROGMEM = {
+  // active_row_ == 0
+  PARAMETER_GLIDE,
+  PARAMETER_VCO_DETUNE,
+  PARAMETER_VCO_FINE,
+  PARAMETER_LFO_SHAPE,
+  PARAMETER_LFO_RATE,
+  PARAMETER_ENV_ATTACK,
+  PARAMETER_ENV_DECAY,
+  PARAMETER_ENV_SUSTAIN,
+  PARAMETER_ENV_RELEASE,
+  PARAMETER_ENV_VCA_MORPH,
+  
+  PARAMETER_VCO_MOD_BALANCE,
+  PARAMETER_PW_MOD_BALANCE,
+  PARAMETER_CUTOFF_ENV_AMOUNT,
+  PARAMETER_CUTOFF_LFO_AMOUNT,
+  PARAMETER_UNASSIGNED,
+  PARAMETER_UNASSIGNED,
+};
+
+/* static */
+void Ui::HandlePotEvent(uint8_t index, uint8_t value) {
+  if (strummer_enabled_ && index >= 5 && index < 10) {
+    strummer.Update(index - 5, value);
+    return;
+  }
+
+  UnlockPot(index);
+  uint8_t parameter_index = pgm_read_byte(
+      pot_to_parameter_map + index + active_row_ * 16);
+
+  if (!snapped_[index]) {
+    if (snap_position_cache_[index] == -1) {
+      snap_position_cache_[index] = \
+          parameter_manager.GetScaled(parameter_index);
+    }
+    int16_t distance = snap_position_cache_[index] - value;
+    if (distance < 8 && distance > -8) {
+      snapped_[index] = true;
+      display_snap_delta_ = 0;
+    } else {
+      display_snap_delta_ = distance > 0 ? 1 : -1;
+    }
+  }
+  if (snapped_[index]) {
+    parameter_manager.SetScaled(parameter_index, value);
+  }
+}
+
+/* static */
+void Ui::DoEvents() {
+  while (queue_.available()) {
+    Event e = queue_.PullEvent();
+    if (e.control_type == CONTROL_SWITCH) {
+      HandleSwitchEvent(e.control_id);
+    } else if (e.control_type == CONTROL_POT) {
+      HandlePotEvent(e.control_id, e.value);
+    }
+    queue_.Touch();
+  }
+  if (midi_dispatcher.learning_midi_channel()) {
+    display_mode_ = DISPLAY_MODE_MIDI_CHANNEL;
+  }
+  if (queue_.idle_time_ms() > 2500) {
+    display_mode_ = DISPLAY_MODE_LFO_GATE_CLOCK;
+    display_snap_delta_ = 0;
+  }
+  if (queue_.idle_time_ms() > 10000) {
+    TrySavingSettings();
+    queue_.Touch();
+  }
+}
+
+/* static */
+void Ui::TrySavingSettings() {
+  if (voice_controller.at_rest()) {
+    busy_ = true;
+    voice_controller.SavePatch();
+    busy_ = false;
+  }
+}
+
+/* static */
+void Ui::UpdateLeds() {
+  uint8_t led_pattern = 0;
+pwm_cycle_ += 32;
+// 3 horizontal LEDs.
+if (display_mode_ == DISPLAY_MODE_LFO_GATE_CLOCK) {
+if (voice_controller.voice().lfo() > pwm_cycle_) {
+led_pattern |= BV(OUTPUT_LFO_LED);
+}
+if (voice_controller.voice().gate()) {
+led_pattern |= BV(OUTPUT_GATE_LED);
+}
+if (voice_controller.sequencer_running() &&
+!((voice_controller.sequencer_step() - 1) & 0x03)) {
+led_pattern |= BV(OUTPUT_CLOCK_LED);
+}
+} else if (display_mode == DISPLAY_MODE_PPQN_SETTING) {
+led_pattern |= BV(OUTPUT_LFO_LED) << system_settings.clock_ppqn();
+} else if (display_mode == DISPLAY_MODE_MIDI_CHANNEL) {
+led_pattern |= (system_settings.midi_channel() & 0x07) << OUTPUT_LFO_LED;
+}
+if (voice_controller.sequencer_recording()) {
+uint8_t bar = voice_controller.sequence_length() & 0x03;
+if (bar) {
+led_pattern = (1 << (bar - 1)) << OUTPUT_LFO_LED;
+} else {
+led_pattern = 0;
+}
+}
+if (display_snap_delta) {
+led_pattern = display_snap_delta > 0
+? _BV(OUTPUT_CLOCK_LED)
+: _BV(OUTPUT_LFO_LED);
+}
+// 3 vertical LEDs.
+if (busy_) {
+led_pattern |= 
+_BV(OUTPUT_ROW_1_LED) | _BV(OUTPUT_ROW_2_LED) | _BV(OUTPUT_ROW_3_LED);
+} else if (voice_controller.sequencer_recording()) {
+// Light Row 1 & Row 2 to show Rec active; light Row 3 (Drums) when Slide is latched.
+led_pattern |= _BV(OUTPUT_ROW_1_LED) | _BV(OUTPUT_ROW_2_LED);
+if (voice_controller.slide_latched()) {
+led_pattern |= _BV(OUTPUT_ROW_3_LED);
+}
+} else if (inputs.low(3)) {
+// While Hold is pressed, show the active sequence slot (0, 1, or 2) on the 3 row LEDs.
+led_pattern |= BV(OUTPUT_ROW_1_LED) >> voice_controller.current_sequence_slot();
+} else {
+led_pattern |= BV(OUTPUT_ROW_1_LED) >> active_row;
+}
+if (display_mode == DISPLAY_MODE_MIDI_FILTER) {
+led_pattern = (system_settings.midi_out_mode()) & 0x3f;
+}
+// Dim the LEDs 50% when hold mode is enabled.
+if ((voice_controller.hold_state() || strummer_enabled_) && pwm_cycle_) {
+led_pattern = 0;
+}
+led_pattern_ = led_pattern;
+}
+/* extern */
+Ui ui;
+/* extern */
+Inputs inputs;
+/* extern */
+Outputs outputs;
+} // namespace anu
+
+---
+
+### Final Step: Strip Drum Tables & Build in Docker
+
+1. **Remove Drum Sample Tables (`anu/resources/` & `anu/makefile`):**
+   * In `anu/makefile`, remove `drum_synth.cc` and `audio_buffer.cc` from `CC_FILES` if present (or leave `audio_buffer.cc` if unused—the linker discards unreferenced functions).
+   * In `anu/resources/lookup_tables.py` and `anu/resources/waveforms.py` (or `resources.py`), delete `drm_env_increments`, `drm_phase_increments`, `drm_envelope`, `sine`, `hh`, and `drum_map_node_0..8`—or simply delete them directly from `anu/resources.cc` and `anu/resources.h` so you don't even need to run `make resources`.
+2. **Compile via Docker:**
+   ```bash
+   docker run --rm -it -v "$PWD":/src -w /src ubuntu:22.04 bash -c \
+     "apt-get update && apt-get install -y make gcc-avr binutils-avr avr-libc python3 && \
+      ln -s /usr/bin/python3 /usr/bin/python && \
+      make -f anu/makefile && make -f anu/makefile size && make -f anu/makefile midi"
+3. Flash & Initialize EEPROM:
+    * Send build/anu/anu.syx via MIDI SysEx while holding Hold at power-on (250 ms packet delay).
+    * After flashing completes, power-cycle while holding Run/stop (inputs.ReadRegister() & 0x4 in Init()) once so ResetToFactoryDefaults() writes clean initial sequences into all 3 EEPROM slots.
+
+If you hit any compiler warnings or linker errors (for example, in anu/makefile or anu/sysex_handler.cc), paste the compiler error output here and I will fix it right away!
+
+
+AI responses may include mistakes. Learn more
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+bash
+git submodule update --init --recursive
+sudo apt-get update && sudo apt-get install -y make gcc-avr binutils-avr avr-libc python3
+sudo ln -sf /usr/bin/python3 /usr/bin/python
+make -f anu/makefile && make -f anu/makefile size && make -f anu/makef
+bash
+git submodule update --init --recursive
+sudo apt-get update && sudo apt-get install -y make gcc-avr binutils-avr avr-libc python3
+sudo ln -sf /usr/bin/python3 /usr/bin/python
+make -f anu/makefile && make -f anu/makefile size && make -f anu/makef
