@@ -80,7 +80,6 @@ void Ui::Init() {
   parameter_manager.Init();
 }
 
-// This is used to convert a pot index into addresses for the ADC muxes.
 const uint8_t pots_layout[] = {
   // Bottom row
    6,  0,  4,  2,  1,
@@ -95,7 +94,6 @@ void Ui::Poll() {
   if (disable_switch_sensing_) {
     --disable_switch_sensing_;
   } else {
-    // Scan switches
     uint8_t mask = 1;
     for (uint8_t i = 0; i < kNumSwitches; ++i) {
       if (inputs.raised(i + 2)) {
@@ -103,20 +101,20 @@ void Ui::Poll() {
           inhibit_switch_ ^= mask;
         } else {
           uint8_t control_index = CONTROL_SEQ_BUTTON;
-          if (inputs.low(3)) {
+          // Allow Hold+Button slot switching only when NOT recording, so Hold
+          // acts immediately as a Tie button during step recording.
+          if (inputs.low(3) && !voice_controller.sequencer_recording()) {
             inhibit_switch_ = _BV(1);
             control_index = CONTROL_SHIFT_SEQ_BUTTON;
           }
           control_index += i;
           queue_.AddEvent(CONTROL_SWITCH, control_index, 1);
-          // In the next 100ms, no switch event may be generated.
           disable_switch_sensing_ = 61;
           long_press_counter_ = 0;
         }
       }
       mask <<= 1;
     }
-    // Detect the long press on the run/stop and the hold buttons.
     if (inputs.lowered(3) || inputs.lowered(5)) {
       long_press_counter_ = 0;
     }
@@ -124,7 +122,7 @@ void Ui::Poll() {
       ++long_press_counter_;
     }
     if (long_press_counter_ == 1224) {
-      if (inputs.low(3)) {
+      if (inputs.low(3) && !voice_controller.sequencer_recording()) {
         queue_.AddEvent(CONTROL_SWITCH, CONTROL_SHIFT_LONG_PRESS, 1);
         inhibit_switch_ = _BV(1);
       } else if (inputs.low(5)) {
@@ -134,7 +132,6 @@ void Ui::Poll() {
     }
   }
   
-  // Read pot value and launch ADC scan.
   uint16_t adc_value = adc.ReadOut();
   int16_t delta = adc_values_[scanned_pot_] - adc_value;
   if (delta < 0) {
@@ -142,8 +139,6 @@ void Ui::Poll() {
   }
   if (delta >= adc_thresholds_[scanned_pot_]) {
     adc_values_[scanned_pot_] = adc_value;
-    // Do not post events in the queue until 16 scanning cycles have been
-    // performed.
     if (!pot_scanning_warm_up_) {
       queue_.AddEvent(CONTROL_POT, scanned_pot_, adc_value >> 2);
     }
@@ -171,7 +166,6 @@ void Ui::Poll() {
 /* static */
 void Ui::UnlockPot(uint8_t index) {
   if (index < kNumSoftPots) {
-    // Soft pots have a higher threshold than hardwired ones.
     adc_thresholds_[index] = 8;
   } else {
     adc_thresholds_[index] = 4;
@@ -201,17 +195,19 @@ void Ui::HandleSwitchEvent(uint8_t index) {
       break;
     
     case CONTROL_KBD_BUTTON:
-      active_row_ = 1;
-      LockPots(true);
+      if (voice_controller.sequencer_recording()) {
+        voice_controller.InsertRest();
+      } else {
+        active_row_ = 1;
+        LockPots(true);
+      }
       break;
       
     case CONTROL_SEQ_BUTTON:
       if (voice_controller.sequencer_recording()) {
-        voice_controller.InsertRest();
-      } else {
-        active_row_ = 2;
-        LockPots(false);
+        voice_controller.ToggleSlideLatch();
       }
+      // When not recording, Drums knob page is disabled.
       break;
       
     case CONTROL_RUN_STOP_BUTTON:
@@ -245,17 +241,15 @@ void Ui::HandleSwitchEvent(uint8_t index) {
       break;
       
     case CONTROL_SHIFT_ADSR_BUTTON:
-      midi_dispatcher.LearnChannel();
+      voice_controller.SwitchSequenceSlot(0);
       break;
 
     case CONTROL_SHIFT_KBD_BUTTON:
-      display_mode_ = DISPLAY_MODE_MIDI_FILTER;
+      voice_controller.SwitchSequenceSlot(1);
       break;
       
     case CONTROL_SHIFT_SEQ_BUTTON:
-      system_settings.ChangePpqn();
-      voice_controller.TouchClock();
-      display_mode_ = DISPLAY_MODE_PPQN_SETTING;
+      voice_controller.SwitchSequenceSlot(2);
       break;
     
     case CONTROL_SHIFT_RUN_STOP_BUTTON:
@@ -296,44 +290,6 @@ const prog_uint8_t pot_to_parameter_map[16 * kNumRows] PROGMEM = {
   PARAMETER_CUTOFF_LFO_AMOUNT,
   PARAMETER_UNASSIGNED,
   PARAMETER_UNASSIGNED,
-
-  // active_row_ == 1
-  PARAMETER_TEMPO,
-  PARAMETER_SWING,
-  PARAMETER_ARP_MODE,
-  PARAMETER_ARP_PATTERN,
-  PARAMETER_ARP_ACIDITY,
-  PARAMETER_VCO_DCO_RANGE,
-  PARAMETER_VCO_DCO_FINE,
-  PARAMETER_VIBRATO_RATE,
-  PARAMETER_VIBRATO_DESTINATION,
-  PARAMETER_VELOCITY_MOD,
-
-  PARAMETER_VCO_MOD_BALANCE,
-  PARAMETER_PW_MOD_BALANCE,
-  PARAMETER_CUTOFF_ENV_AMOUNT,
-  PARAMETER_CUTOFF_LFO_AMOUNT,
-  PARAMETER_UNASSIGNED,
-  PARAMETER_UNASSIGNED,
-  
-  // active_row_ == 2
-  PARAMETER_DRUMS_X,
-  PARAMETER_DRUMS_BD_DENSITY,
-  PARAMETER_DRUMS_SD_DENSITY,
-  PARAMETER_DRUMS_HH_DENSITY,
-  PARAMETER_DRUMS_BALANCE,
-  PARAMETER_DRUMS_Y,
-  PARAMETER_DRUMS_BD_TONE,
-  PARAMETER_DRUMS_SD_TONE,
-  PARAMETER_DRUMS_HH_TONE,
-  PARAMETER_DRUMS_BANDWIDTH,
-
-  PARAMETER_VCO_MOD_BALANCE,
-  PARAMETER_PW_MOD_BALANCE,
-  PARAMETER_CUTOFF_ENV_AMOUNT,
-  PARAMETER_CUTOFF_LFO_AMOUNT,
-  PARAMETER_UNASSIGNED,
-  PARAMETER_UNASSIGNED,
 };
 
 /* static */
@@ -348,7 +304,6 @@ void Ui::HandlePotEvent(uint8_t index, uint8_t value) {
       pot_to_parameter_map + index + active_row_ * 16);
 
   if (!snapped_[index]) {
-    // Unlock pot until target value is reached.
     if (snap_position_cache_[index] == -1) {
       snap_position_cache_[index] = \
           parameter_manager.GetScaled(parameter_index);
@@ -392,7 +347,7 @@ void Ui::DoEvents() {
 
 /* static */
 void Ui::TrySavingSettings() {
-  if (voice_controller.at_rest() && drum_synth.idle_time_ms() > 10000) {
+  if (voice_controller.at_rest()) {
     busy_ = true;
     voice_controller.SavePatch();
     busy_ = false;
@@ -402,70 +357,66 @@ void Ui::TrySavingSettings() {
 /* static */
 void Ui::UpdateLeds() {
   uint8_t led_pattern = 0;
-  pwm_cycle_ += 32;
-  
-  // 3 horizontal LEDs.
-  
-  // Default status: Lfo / Gate / Clock blinkers.
-  if (display_mode_ == DISPLAY_MODE_LFO_GATE_CLOCK) {
-    if (voice_controller.voice().lfo() > pwm_cycle_) {
-      led_pattern |= _BV(OUTPUT_LFO_LED);
-    }
-    if (voice_controller.voice().gate()) {
-      led_pattern |= _BV(OUTPUT_GATE_LED);
-    }
-    if (voice_controller.sequencer_running() &&
-        !((voice_controller.sequencer_step() - 1) & 0x03)) {
-      led_pattern |= _BV(OUTPUT_CLOCK_LED);
-    }
-  // A bunch of special cases in MIDI learn mode.
-  } else if (display_mode_ == DISPLAY_MODE_PPQN_SETTING) {
-    led_pattern |= _BV(OUTPUT_LFO_LED) << system_settings.clock_ppqn();
-  } else if (display_mode_ == DISPLAY_MODE_MIDI_CHANNEL) {
-    led_pattern |= (system_settings.midi_channel() & 0x07) << OUTPUT_LFO_LED;
-  }
-  if (voice_controller.sequencer_recording()) {
-    uint8_t bar = voice_controller.sequence_length() & 0x03;
-    if (bar) {
-      led_pattern = (1 << (bar - 1)) << OUTPUT_LFO_LED;
-    } else {
-      led_pattern = 0;
-    }
-  }
-  if (display_snap_delta_) {
-    led_pattern = display_snap_delta_ > 0
-        ? _BV(OUTPUT_CLOCK_LED)
-        : _BV(OUTPUT_LFO_LED);
-  }
-  
-  // 3 vertical LEDs.
-  
-  // Default status: current page.
-  if (voice_controller.sequencer_recording() || busy_) {
-    led_pattern |= \
-        _BV(OUTPUT_ROW_1_LED) | _BV(OUTPUT_ROW_2_LED) | _BV(OUTPUT_ROW_3_LED);
-  } else {
-    led_pattern |= _BV(OUTPUT_ROW_1_LED) >> active_row_;
-  }
-  if (display_mode_ == DISPLAY_MODE_MIDI_FILTER) {
-    led_pattern = (system_settings.midi_out_mode()) & 0x3f;
-  }
-  
-  // Dim the LEDs 50% when hold mode is enabled.
-  if ((voice_controller.hold_state() || strummer_enabled_) && pwm_cycle_) {
-    led_pattern = 0;
-  }
-  
-  led_pattern_ = led_pattern;
+pwm_cycle_ += 32;
+// 3 horizontal LEDs.
+if (display_mode_ == DISPLAY_MODE_LFO_GATE_CLOCK) {
+if (voice_controller.voice().lfo() > pwm_cycle_) {
+led_pattern |= BV(OUTPUT_LFO_LED);
 }
-
+if (voice_controller.voice().gate()) {
+led_pattern |= BV(OUTPUT_GATE_LED);
+}
+if (voice_controller.sequencer_running() &&
+!((voice_controller.sequencer_step() - 1) & 0x03)) {
+led_pattern |= BV(OUTPUT_CLOCK_LED);
+}
+} else if (display_mode == DISPLAY_MODE_PPQN_SETTING) {
+led_pattern |= BV(OUTPUT_LFO_LED) << system_settings.clock_ppqn();
+} else if (display_mode == DISPLAY_MODE_MIDI_CHANNEL) {
+led_pattern |= (system_settings.midi_channel() & 0x07) << OUTPUT_LFO_LED;
+}
+if (voice_controller.sequencer_recording()) {
+uint8_t bar = voice_controller.sequence_length() & 0x03;
+if (bar) {
+led_pattern = (1 << (bar - 1)) << OUTPUT_LFO_LED;
+} else {
+led_pattern = 0;
+}
+}
+if (display_snap_delta) {
+led_pattern = display_snap_delta > 0
+? _BV(OUTPUT_CLOCK_LED)
+: _BV(OUTPUT_LFO_LED);
+}
+// 3 vertical LEDs.
+if (busy_) {
+led_pattern |= 
+_BV(OUTPUT_ROW_1_LED) | _BV(OUTPUT_ROW_2_LED) | _BV(OUTPUT_ROW_3_LED);
+} else if (voice_controller.sequencer_recording()) {
+// Light Row 1 & Row 2 to show Rec active; light Row 3 (Drums) when Slide is latched.
+led_pattern |= _BV(OUTPUT_ROW_1_LED) | _BV(OUTPUT_ROW_2_LED);
+if (voice_controller.slide_latched()) {
+led_pattern |= _BV(OUTPUT_ROW_3_LED);
+}
+} else if (inputs.low(3)) {
+// While Hold is pressed, show the active sequence slot (0, 1, or 2) on the 3 row LEDs.
+led_pattern |= BV(OUTPUT_ROW_1_LED) >> voice_controller.current_sequence_slot();
+} else {
+led_pattern |= BV(OUTPUT_ROW_1_LED) >> active_row;
+}
+if (display_mode == DISPLAY_MODE_MIDI_FILTER) {
+led_pattern = (system_settings.midi_out_mode()) & 0x3f;
+}
+// Dim the LEDs 50% when hold mode is enabled.
+if ((voice_controller.hold_state() || strummer_enabled_) && pwm_cycle_) {
+led_pattern = 0;
+}
+led_pattern_ = led_pattern;
+}
 /* extern */
 Ui ui;
-
 /* extern */
 Inputs inputs;
-
 /* extern */
 Outputs outputs;
-
 }  // namespace anu
