@@ -1,3 +1,4 @@
+cpp
 // Copyright 2012 Emilie Gillet.
 //
 // Author: Emilie Gillet (emilie.o.gillet@gmail.com)
@@ -19,7 +20,6 @@
 #include "avrlib/timer.h"
 #include "avrlib/watchdog_timer.h"
 
-#include "anu/audio_buffer.h"
 #include "anu/clock.h"
 #include "anu/dco_controller.h"
 #include "anu/hardware_config.h"
@@ -34,7 +34,6 @@
 using namespace avrlib;
 using namespace anu;
 using namespace midi;
-
 
 DAC1SS dac_1_ss;
 DAC2SS dac_2_ss;
@@ -58,7 +57,6 @@ volatile uint16_t clock_ticks = 0;
 volatile uint8_t num_external_clock_events = 0;
 
 inline void FlushMidiOut() {
-  // Try to flush the high priority buffer first.
   if (midi_dispatcher.readable_high_priority()) {
     if (midi_io.writable()) {
       midi_io.Overwrite(midi_dispatcher.ImmediateReadHighPriority());
@@ -84,8 +82,6 @@ inline bool UpdateDACs() {
   const DACState& dac_state = voice_controller.voice().dac_state();
   
   // Write VCO CV.
-  // 0.5V / Oct.
-  // 2.048V = Midi note 60 = 261.625
   dac_value.value = 0x1000 | dac_state.vco_cv;
   dac_1_ss.Low();
   dac.Send(dac_value.bytes[1]);
@@ -93,7 +89,6 @@ inline bool UpdateDACs() {
   dac_1_ss.High();
   
   // Write VCF CV.
-  // 0.5V / Oct.
   dac_value.value = 0x9000 | dac_state.vcf_cv;
   dac_1_ss.Low();
   dac.Send(dac_value.bytes[1]);
@@ -120,30 +115,22 @@ inline bool UpdateDACs() {
 static uint8_t cycle = 0;
 static uint8_t previous_in = 0xff;
 
-// 4.9kHz: MIDI in/out; gate & clock poll.
-// 2.45kHz: DAC & DCO refresh
-// 0.61kHz: UI poll
 ISR(TIMER0_OVF_vect, ISR_NOBLOCK) {
   if (cycle & 1) {
     if (UpdateDACs()) {
       dco_controller.set_note(voice_controller.voice().dco_pitch());
     } else {
-      // Mute the DCO when no note is playing to avoid signal bleed through the
-      // drums channel.
       dco_controller.Mute();
     }
   }
   PollMidiIn();
   FlushMidiOut();
   
-  // Read the input shift register without updating the switch debounce state.
   uint8_t in = inputs.ReadRegister();
   
-  // Detect raising edges on the Trig line.
   if ((in & (1 << INPUT_TRIG)) && !(previous_in & (1 << INPUT_TRIG))) {
     ++num_external_clock_events;
   }
-  // Detect raising and falling edges on the Gate line.
   if ((in & (1 << INPUT_GATE)) && !(previous_in & (1 << INPUT_GATE))) {
     voice_controller.GateOn();
   }
@@ -152,7 +139,6 @@ ISR(TIMER0_OVF_vect, ISR_NOBLOCK) {
   }
   previous_in = in;
   
-  // Writes to the output shift register (LED and Gate/Trig).
   uint8_t out = ui.led_pattern();
   if (voice_controller.voice().gate() &&
       !voice_controller.voice().retriggered()) {
@@ -173,8 +159,6 @@ ISR(TIMER0_OVF_vect, ISR_NOBLOCK) {
   ++cycle;
 }
 
-// 2.5 MHz timebase used for oscillators calibration, and for DCO.
-
 volatile uint8_t num_overflows;
 
 ISR(TIMER1_CAPT_vect) {
@@ -191,10 +175,10 @@ ISR(TIMER1_OVF_vect, ISR_NOBLOCK) {
   ++num_overflows;
 }
 
-// 39kHz clock used for the tempo counter.
+// 39kHz clock used for the tempo counter; drum PWM output held silent at 0.
 ISR(TIMER2_OVF_vect, ISR_NOBLOCK) {
   clock.Tick();
-  audio_out.Write(audio_buffer.ImmediateRead());
+  audio_out.Write(0);
 }
 
 inline void Init() {
@@ -204,7 +188,6 @@ inline void Init() {
   
   midi_io.Init();
   system_settings.Init();
-  drum_synth.Init();
   voice_controller.Init();
   voice_tuner.Init();
   
@@ -231,6 +214,7 @@ inline void Init() {
   clock_timer.Start();
   
   audio_out.Init();
+  audio_out.Write(0);
   
   dco_controller.Start();
 }
@@ -239,30 +223,8 @@ int main(void) {
   Init();
   ui.FlushEvents();
   while (1) {
-    // Fill some samples for the DACs.
     voice_controller.mutable_voice()->Refresh();
-    
-    // Fill some samples for the PWM out. To avoid getting the 40kHz PWM carrier 
-    // when unnecessary, we set the output to 0 unless:
-    // - The drum machine is configured to play a pattern.
-    // - We have received a note message on MIDI channel 10, which is a hint
-    //   that an external sequencer might trigger Anushri's drum synth.
-    if (voice_controller.has_drums() ||
-        midi_dispatcher.seen_midi_drum_events() ||
-        drum_synth.playing()) {
-      drum_synth.Render();
-    } else {
-      drum_synth.FillWithSilence();
-    }
-    
-    // If we have not received any event on channel 10 for 5 mins, we consider
-    // that no further event will come and we preventively disable the drum
-    // engine.
-    if (drum_synth.idle_time_ms() > 300000) {
-      midi_dispatcher.ResetDrumEventMonitor();
-    }
 
-    // Count how many clock ticks have elapsed since the last refresh.
     if (voice_controller.internal_clock()) {
       uint8_t num_events = clock.CountEvents();
       while (num_events) {
@@ -277,19 +239,21 @@ int main(void) {
       }
     }
     
-    // Check if there is some MIDI data to process. If so, decode the MIDI
-    // bytestream.
     while (midi_in_buffer.readable()) {
       midi_parser.PushByte(midi_in_buffer.ImmediateRead());
     }
     
-    // Update the voice tuner state machine.
     voice_tuner.Refresh();
     if (num_overflows > 32) {
       voice_tuner.Abort();
     }
     
-    // Handle UI events
     ui.DoEvents();
   }
 }
+
+
+
+
+
+    
