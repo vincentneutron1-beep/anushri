@@ -27,6 +27,7 @@
 namespace anu {
 
 static const uint8_t kNumDrumParts = 3;
+static const uint8_t kNumSequenceSlots = 3;
 
 enum ArpeggiatorDirection {
   ARPEGGIO_DIRECTION_UP = 0,
@@ -85,11 +86,7 @@ struct SequencerSettings {
   
   inline uint8_t arp_range() const { return ((arp_mode - 1) & 0x01) + 1; }
   inline uint8_t arp_direction() const { return (arp_mode - 1) >> 1; }
-  inline bool has_drums() const {
-    return (drums_density[0] > 1) || \
-        (drums_density[1] > 1) || \
-        (drums_density[2] > 1) || drums_override;
-  }
+  inline bool has_drums() const { return false; }
 };
 
 struct Sequence {
@@ -118,26 +115,30 @@ class VoiceController {
     StartClock();
     StartArpeggiator();
     StartSequencer();
-    StartDrumMachine();
   }
   static inline void Stop() {
     StopSequencer();
     StopClock();
   }
   
+  static void RecordStep(uint8_t note);
+  
   static inline void InsertRest() {
-    sequence_.notes[sequence_.num_notes++] = 0xff;
-    if (sequence_.num_notes == 128) {
-      StopRecording();
-    }
-  };
+    RecordStep(0xff);
+  }
   
   static inline void InsertTie() {
-    sequence_.notes[sequence_.num_notes++] = 0xfe;
-    if (sequence_.num_notes == 128) {
-      StopRecording();
+    RecordStep(0xfe);
+  }
+  
+  static inline void ToggleSlideLatch() {
+    if (sequencer_recording_) {
+      slide_latched_ = !slide_latched_;
     }
-  };
+  }
+  
+  static void SwitchSequenceSlot(uint8_t slot);
+  static void LoadSequence();
   
   static inline void HoldNotes() {
     if (ignore_note_off_messages_) {
@@ -151,7 +152,7 @@ class VoiceController {
   
   static void StopRecording();
   static void SaveSequence();
-  static void RemoteControlDrumSequencer(uint8_t note);
+  static inline void RemoteControlDrumSequencer(uint8_t note) { }
   static void StartRecording();
   
   static void GateOn() { voice_.GateOn(); }
@@ -166,6 +167,8 @@ class VoiceController {
 
   static inline bool sequencer_running() { return sequencer_running_; }
   static inline bool sequencer_recording() { return sequencer_recording_; }
+  static inline bool slide_latched() { return slide_latched_; }
+  static inline uint8_t current_sequence_slot() { return current_sequence_slot_; }
   static inline bool hold_state() { return ignore_note_off_messages_; }
   static inline uint8_t clock_pulse() { return clock_pulse_; }
   static inline uint8_t sequencer_step() { return sequencer_note_; }
@@ -174,9 +177,7 @@ class VoiceController {
   static inline bool at_rest() {
     return pressed_keys_.size() == 0 && !sequencer_running_ && voice_.at_rest();
   }
-  static inline bool has_drums() {
-    return (sequencer_running_ && seq_settings_.has_drums());
-  }
+  static inline bool has_drums() { return false; }
   static inline bool has_arpeggiator() {
     return (seq_settings_.arp_mode && pressed_keys_.size());
   }
@@ -197,8 +198,6 @@ class VoiceController {
   static void ReleaseAllHeldNotes();
   
   static void Touch() {
-    RefreshDrumSynthSettings();
-    RefreshDrumSynthMixing();
     voice_.Touch();
   }
   static void TouchClock();
@@ -217,18 +216,6 @@ class VoiceController {
   static void ClockSequencer();
   static void StopSequencer();
   
-  static void StartDrumMachine();
-  static void ClockDrumMachine();
-  
-  static void RefreshDrumSynthSettings();
-  static void RefreshDrumSynthMixing();
-  
-  static uint8_t ReadDrumMap(
-      uint8_t step,
-      uint8_t instrument,
-      uint8_t x,
-      uint8_t y);
-  
   static SequencerSettings seq_settings_;
   static Sequence sequence_;
   static Voice voice_;
@@ -242,6 +229,8 @@ class VoiceController {
 
   static bool sequencer_running_;
   static bool sequencer_recording_;
+  static bool slide_latched_;
+  static uint8_t current_sequence_slot_;
   static bool clock_running_;
   static uint8_t sequencer_note_;
   static int8_t sequencer_transposition_;
@@ -253,11 +242,6 @@ class VoiceController {
   static int8_t arp_direction_;
   static int8_t arp_step_;
   static int8_t arp_octave_;
-  
-  static uint8_t drum_sequencer_step_;
-  static uint8_t drum_sequencer_perturbation_[kNumDrumParts];
-  
-  static uint8_t drum_remote_control_current_instrument_;
   
   static bool dirty_;
   
