@@ -705,3 +705,205 @@ void VoiceController::RemoteControlDrumSequencer(uint8_t note) {
 VoiceController voice_controller;
 
 };  // namespace anu
+seq_settings_.arp_direction() == ARPEGGIO_DIRECTION_DOWN ? -1 : 1;
+ResetArpeggiatorPattern();
+}
+/* static */
+void VoiceController::StopClock() {
+clock_running_ = false;
+midi_dispatcher.OnStop();
+}
+/* static */
+void VoiceController::StopSequencer() {
+AllSoundOff();
+midi_dispatcher.OnInternalNoteOff(previous_generated_note_);
+previous_generated_note_ = 0xff;
+sequencer_running_ = false;
+}
+/* static */
+void VoiceController::StopArpeggiator() {
+AllNotesOff();
+midi_dispatcher.OnInternalNoteOff(previous_generated_note_);
+previous_generated_note_ = 0xff;
+}
+/* static */
+void VoiceController::ClockSequencer() {
+if (!sequence_.num_notes || !sequencer_running_) {
+return;
+}
+int16_t note = sequence_.notes[sequencer_note_];
+if (note == 0xff) {
+// Rest.
+voice_.NoteOff(previous_generated_note_);
+midi_dispatcher.OnInternalNoteOff(previous_generated_note_);
+previous_generated_note_ = 0xff;
+} else if (note == 0xfe) {
+// Tie: do nothing!
+} else {
+uint8_t accent_slide_index = sequencer_note_ >> 3;
+uint8_t accent_slide_mask = 1 << (sequencer_note_ & 0x7);
+note += sequencer_transposition_;
+bool slid = sequence_.slides[accent_slide_index] & accent_slide_mask;
+bool accented = sequence_.accents[accent_slide_index] & accent_slide_mask;
+if (!slid) {
+midi_dispatcher.OnInternalNoteOff(previous_generated_note_);
+}
+voice_.NoteOn(
+note,
+sequencer_velocity_,
+slid ? 0x60 : 0,
+accented ? 0x70 : 0,
+slid);
+midi_dispatcher.OnInternalNoteOn(
+note,
+accented ? 0x7f : sequencer_velocity_);
+if (previous_generated_note_ != 0xff && slid) {
+midi_dispatcher.OnInternalNoteOff(previous_generated_note_);
+}
+previous_generated_note_ = note;
+}
+++sequencer_note_;
+if (sequencer_note_ >= sequence_.num_notes) {
+sequencer_note_ = 0;
+}
+}
+const prog_uint8_t slide_probability[] PROGMEM = {
+1, 0, 4, 4, 2, 0, 8, 6, 1, 1, 0, 0, 0, 0, 15, 15,
+};
+const prog_uint8_t accent_level[] PROGMEM = {
+16, 0, 2, 0, 1, 0, 0, 0, 8, 0, 1, 0, 4, 0, 2, 2,
+};
+/* static */
+void VoiceController::ClockArpeggiator() {
+if (has_arpeggiator()) {
+uint16_t pattern = pgm_read_word(
+lut_res_arpeggiator_patterns + seq_settings_.arp_pattern);
+uint8_t has_arpeggiator_note = (arp_pattern_mask_ & pattern) ? 255 : 0;
+if (has_arpeggiator_note) {
+StepArpeggiator();
+const NoteEntry& arpeggio_note = pressed_keys_.sorted_note(arp_step_);
+uint8_t note = arpeggio_note.note;
+uint8_t velocity = arpeggio_note.velocity;
+note += 12 * arp_octave_;
+while (note > 127) {
+note -= 12;
+}
+uint8_t random = Random::GetByte();
+uint8_t slide_threshold = U8U8Mul(
+pgm_read_byte(slide_probability + arp_pattern_step_),
+seq_settings_.acidity);
+if (arp_step_ == 0) {
+slide_threshold >>= 1;
+}
+uint8_t accent = U8U8Mul(
+pgm_read_byte(accent_level + arp_pattern_step_),
+seq_settings_.acidity) >> 1;
+accent = (accent + U8U8MulShift8(accent, random)) >> 1;
+bool slid = random < slide_threshold;
+if (!slid) {
+midi_dispatcher.OnInternalNoteOff(previous_generated_note_);
+}
+voice_.NoteOn(note, velocity, slid ? 0x60 : 0, accent, slid);
+if (slid) {
+midi_dispatcher.OnInternalNoteOff(previous_generated_note_);
+}
+midi_dispatcher.OnInternalNoteOn(note, velocity);
+previous_generated_note_ = note;
+} else {
+voice_.NoteOff(previous_generated_note_);
+midi_dispatcher.OnInternalNoteOff(previous_generated_note_);
+previous_generated_note_ = 0xff;
+}
+}
+++arp_pattern_step_;
+arp_pattern_mask_ <<= 1;
+if (!arp_pattern_mask_) {
+arp_pattern_mask_ = 1;
+arp_pattern_step_ = 0;
+}
+}
+/* static */
+void VoiceController::ResetArpeggiatorPattern() {
+arp_step_ = arp_direction_ == 1 ? -1 : pressed_keys_.size();
+arp_octave_ = arp_direction_ == 1 ? 0 : seq_settings_.arp_range() - 1;
+}
+/* static */
+void VoiceController::StepArpeggiator() {
+uint8_t num_notes = pressed_keys_.size();
+if (seq_settings_.arp_direction() == ARPEGGIO_DIRECTION_RANDOM) {
+uint8_t random_byte = Random::GetByte();
+arp_octave_ = random_byte & 0xf;
+arp_step_ = (random_byte & 0xf0) >> 4;
+while (arp_octave_ >= seq_settings_.arp_range()) {
+arp_octave_ -= seq_settings_.arp_range();
+}
+while (arp_step_ >= num_notes) {
+arp_step_ -= num_notes;
+}
+} else {
+arp_step_ += arp_direction_;
+uint8_t change_octave = 0;
+if (arp_step_ >= num_notes) {
+arp_step_ = 0;
+change_octave = 1;
+} else if (arp_step_ < 0) {
+arp_step_ = num_notes - 1;
+change_octave = 1;
+}
+if (change_octave) {
+arp_octave_ += arp_direction_;
+if (arp_octave_ >= seq_settings_.arp_range() || arp_octave_ < 0) {
+if (seq_settings_.arp_direction() == ARPEGGIO_DIRECTION_UP_DOWN) {
+arp_direction_ = -arp_direction_;
+ResetArpeggiatorPattern();
+if (num_notes > 1 || seq_settings_.arp_range() > 1) {
+StepArpeggiator();
+}
+} else {
+ResetArpeggiatorPattern();
+}
+}
+}
+}
+}
+/* static */
+void VoiceController::StartRecording() {
+Stop();
+StopArpeggiator();
+seq_settings_.arp_mode = 0;
+sequencer_recording_ = true;
+slide_latched_ = false;
+memset(&sequence_, 0, sizeof(Sequence));
+}
+/* static */
+void VoiceController::StopRecording() {
+Stop();
+sequencer_recording_ = false;
+slide_latched_ = false;
+sequencer_transposition_ = 0;
+sequencer_velocity_ = 64;
+SaveSequence();
+}
+/* static */
+void VoiceController::SavePatch() {
+if (dirty_) {
+(seq_settings_);
+}
+voice_.SavePatch();
+dirty_ = false;
+}
+/* static /
+void VoiceController::ResetToFactoryDefaults() {
+storage.ResetToFactoryDefaults(&seq_settings_);
+for (uint8_t slot = 0; slot < kNumSequenceSlots; ++slot) {
+Sequence temp_seq;
+memcpy_P(&temp_seq, &init_sequence, sizeof(Sequence));
+uint16_t addr = kSequenceEepromBase + slot * sizeof(Sequence);
+eeprom_update_block(&temp_seq, reinterpret_cast<void>(addr), sizeof(Sequence));
+}
+LoadSequence();
+voice_.ResetToFactoryDefaults();
+}
+/* extern */
+VoiceController voice_controller;
+};  // namespace anu
